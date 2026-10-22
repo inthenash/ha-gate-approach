@@ -1,0 +1,376 @@
+blueprint:
+  name: Gate - Open on Approach
+  description: >
+    Opens a gate early enough that it is actually open when someone arrives,
+    for gates driven by a momentary relay that auto-close after a fixed time.
+
+
+    WHY THIS EXISTS: a plain zone-enter trigger is unreliable for a driveway
+    gate. The HA companion app reports location every 40-120 s while driving,
+    so a 400 m geofence - about 22 s of travel at 40 mph - can be crossed
+    entirely between two consecutive samples. On 2026-09-06 the 400 m boundary
+    was crossed at ~13:49:22 but the next sample did not arrive until 13:50:17,
+    so the trigger fired 55 s late, after the car was already parked at a
+    closed gate.
+
+
+    GATE CYCLE - the timing everything else is derived from. A pulse starts a
+    fixed sequence: roughly 20 s to swing fully open, ~90 s held open, ~20 s to
+    close. So the usable arrival window is pulse+20 s to pulse+110 s. There is
+    a MINIMUM as well as a maximum: pulse too late and they arrive before it is
+    open; pulse too early and it is already closing. The contact sensor reads
+    "not closed" for the whole ~115 s of travel-plus-dwell, so sensor-on time
+    is NOT the same as the time the gate is actually passable - do not tune
+    against it.
+
+
+    HOW IT WORKS: trigger far out (default 1600 m, so a sample almost always
+    lands inside the window even at speed), then hold until the open distance
+    (default 550 m) before pulsing, placing arrival in the middle of the
+    window. Pulsing at first detection is wrong - the gate would be closing
+    again before arrival.
+
+
+    RETRY LOOP: the pulse sits inside a repeat/until, not a single fire. A slow
+    approach can outlast the cycle, and a one-shot retry guarded on "gate is
+    closed" can never fire, because that decision falls due while the gate is
+    still open. Each pass re-pulses only if the gate has actually closed again,
+    then waits for arrival.
+
+
+    DO NOT REMOVE THE "gate is closed" GUARD. On this controller a pulse while
+    the gate is MOVING stops it dead - it does not reverse. The contact sensor
+    reads "not closed" continuously across open travel, dwell and close travel,
+    so guarding on it is what keeps every pulse confined to the fully-shut
+    state. Loosening that guard to react faster when someone arrives mid-close
+    would strand the gate part-open, and because the sensor then stays "not
+    closed" forever the loop would never re-pulse to recover it. A gate stuck
+    open is worse than a gate that made you wait.
+
+
+    SHARED LOCK: the lock input_boolean is held briefly around each pulse so
+    two people arriving together cannot double-pulse. On a momentary-relay
+    gate a second pulse mid-travel stops or reverses it. Point every instance
+    of this blueprint - and any other automation that pulses the same gate -
+    at the same input_boolean.
+  domain: automation
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    who:
+      name: Who is arriving
+      icon: mdi:account
+      input:
+        person_entity:
+          name: Person
+          description: >
+            The person to watch. Used to skip the run when they are already
+            home, which also guards against a spurious trigger when the
+            distance sensor becomes available after a restart.
+          selector:
+            entity:
+              domain: person
+        distance_sensor:
+          name: Distance-to-gate sensor
+          description: >
+            A numeric sensor giving this person's distance to the gate. The
+            unit must match the threshold values below (metres by default).
+
+
+            Two traps when building it as a template sensor. Do not give it
+            device_class "distance" on an imperial system - HA converts the
+            state to feet and every threshold here is then silently wrong.
+            And guard the template on has_value() and a non-null latitude
+            before calling distance(), or the tracker going unavailable
+            spams "Distance:State does not contain valid location" warnings.
+          selector:
+            entity:
+              domain: sensor
+        away_timer:
+          name: Away timer
+          description: >
+            Run only while this timer is idle. Prevents the gate reopening
+            immediately after the person has just left.
+          selector:
+            entity:
+              domain: timer
+    gate:
+      name: Gate
+      icon: mdi:gate
+      input:
+        gate_cover:
+          name: Gate cover
+          description: >
+            The cover entity for the gate. Every pulse is guarded on this
+            reading "closed", because open/close/stop all fire the same
+            momentary relay and a pulse mid-travel stops the gate dead.
+            See DO NOT REMOVE THE GUARD in the description above.
+          selector:
+            entity:
+              domain: cover
+        lock_boolean:
+          name: Shared pulse lock
+          description: >
+            An input_boolean shared by every automation that can pulse this
+            gate, held briefly around each pulse to prevent double-pulsing.
+          selector:
+            entity:
+              domain: input_boolean
+    tuning:
+      name: Distances and timing
+      icon: mdi:tune
+      collapsed: true
+      input:
+        trigger_distance:
+          name: Trigger distance
+          description: Start watching when the person gets this close.
+          default: 1600
+          selector:
+            number:
+              min: 200
+              max: 10000
+              step: 50
+              unit_of_measurement: m
+              mode: box
+        open_distance:
+          name: Open distance
+          description: >
+            Pulse the gate once the person is this close. Set from the gate's
+            auto-close time and your approach speed - too early and it shuts
+            again before you arrive.
+
+
+            CALIBRATE THIS AGAINST THE GATE, NOT THE ZONE CENTRE. The distance
+            sensor measures to the zone centre, which is usually the house; the
+            gate sits somewhere short of that. On 2026-09-07 the gate proved to
+            be ~124 m from centre, so a 1000 m threshold was really 876 m of
+            driving. That took 120 s against 115 s of open time and the gate
+            shut one second before arrival - every time, not occasionally.
+
+
+            To calibrate: drive in, find the distance value where the vehicle
+            sits still waiting for the gate, then pick an open distance whose
+            travel time is comfortably under the auto-close.
+          default: 550
+          selector:
+            number:
+              min: 100
+              max: 5000
+              step: 50
+              unit_of_measurement: m
+              mode: box
+        arrived_distance:
+          name: Arrived distance
+          description: >
+            Treat the person as through the gate once inside this distance,
+            and stop the retry loop.
+
+
+            Set this just PAST the gate, not at the zone centre. It must stay
+            above the distance the vehicle reads while waiting at a shut gate
+            (or the loop exits and never re-pulses), and below the distance
+            once through (or the loop stays armed and can reopen the gate
+            behind them). Gate measured at ~124 m from centre on 2026-09-07,
+            so 100 m sits ~24 m past it - comfortably clear of ~5 m GPS noise.
+          default: 100
+          selector:
+            number:
+              min: 5
+              max: 300
+              step: 5
+              unit_of_measurement: m
+              mode: box
+        approach_timeout:
+          name: Approach timeout
+          description: >
+            Give up if the person never reaches the open distance after
+            triggering - covers driving past without coming home.
+
+
+            Leave room for a stop on the way. A straight run from 2500 m to
+            500 m takes 2-3 minutes, but on 2026-10-21 a driver triggered at
+            2354 m, went back out to ~2000 m for about 2 minutes, and the old
+            360 s default gave up at ~700 m, about 30 s before the gate would
+            have opened. The pulse only ever fires inside the open distance,
+            so a longer hold costs nothing in early opens. Default raised
+            360 -> 900 s that day.
+          default: 900
+          selector:
+            number:
+              min: 60
+              max: 1800
+              step: 30
+              unit_of_measurement: s
+              mode: box
+        retry_wait:
+          name: Retry interval
+          description: >
+            How long each pass waits for arrival before considering another
+            pulse. This is also the worst-case delay between the gate
+            auto-closing and the loop noticing - keep it short so a re-pulse
+            happens while the vehicle is still approaching rather than after
+            it has parked at a shut gate.
+          default: 20
+          selector:
+            number:
+              min: 15
+              max: 300
+              step: 5
+              unit_of_measurement: s
+              mode: box
+        max_attempts:
+          name: Maximum passes
+          description: >
+            Total passes through the retry loop. Coverage is roughly
+            passes x (retry interval + lock hold), so shortening the retry
+            interval needs more passes to cover the same approach.
+          default: 6
+          selector:
+            number:
+              min: 1
+              max: 10
+              step: 1
+              mode: box
+        closed_settle:
+          name: Closed settle time
+          description: >
+            How long the gate must have read "closed" before a pulse. The
+            contact closes a few seconds before the motor stops, and a pulse
+            in that gap stops the gate instead of opening it (seen twice on
+            2026-09-30, both 3 s after "closed"). The reed reads closed 3-7 s
+            before the motors stop (measured at the gate, 2026-09-30), so 15 s leaves ~8 s of
+            margin. Adds at most this much delay to a re-pulse; a gate that
+            has been shut for a while is unaffected.
+          default: 15
+          selector:
+            number:
+              min: 0
+              max: 30
+              step: 1
+              unit_of_measurement: s
+              mode: box
+        lock_hold:
+          name: Lock hold
+          description: >
+            How long the shared lock is held after a pulse - long enough for
+            the gate's position sensor to catch up.
+          default: 15
+          selector:
+            number:
+              min: 0
+              max: 60
+              step: 1
+              unit_of_measurement: s
+              mode: box
+
+mode: restart
+
+# !input is a YAML tag, not a template value, so anything used inside a
+# Jinja expression below must be bound to a variable here first.
+variables:
+  distance_entity: !input distance_sensor
+  person_id: !input person_entity
+  cover_id: !input gate_cover
+  open_at: !input open_distance
+  arrived_at: !input arrived_distance
+  max_passes: !input max_attempts
+
+triggers:
+  - trigger: numeric_state
+    entity_id: !input distance_sensor
+    below: !input trigger_distance
+
+conditions:
+  - condition: state
+    entity_id: !input away_timer
+    state: idle
+  - condition: not
+    conditions:
+      - condition: state
+        entity_id: !input person_entity
+        state: home
+
+actions:
+  # wait_template, not wait_for_trigger: GPS can jump straight past the
+  # threshold in a single sample (807 m -> 37 m on 2026-09-06). wait_for_trigger
+  # waits for a fresh crossing event and would miss that; wait_template passes
+  # immediately when the condition is already true.
+  - alias: Hold until close enough that the gate will still be open on arrival
+    wait_template: "{{ states(distance_entity) | float(99999) <= open_at }}"
+    timeout:
+      seconds: !input approach_timeout
+    continue_on_timeout: false
+
+  - alias: Pulse the gate, re-pulsing if it auto-closes before arrival
+    repeat:
+      sequence:
+        # The contact reads "closed" a few seconds before the motor finishes.
+        # On 2026-09-30 two re-pulses fired 3 s after "closed": one did nothing
+        # (the gate needed a second pulse 36 s later) and the other took 27 s
+        # to open instead of the usual 6-8 s. Both are the stop-mid-travel
+        # behaviour described under DO NOT REMOVE THE GUARD. So a gate that
+        # has only just read closed gets a short settle wait before the pulse.
+        - if:
+            - condition: state
+              entity_id: !input gate_cover
+              state: closed
+            - condition: not
+              conditions:
+                - condition: state
+                  entity_id: !input gate_cover
+                  state: closed
+                  for:
+                    seconds: !input closed_settle
+          then:
+            - delay:
+                seconds: !input closed_settle
+        - if:
+            - condition: state
+              entity_id: !input gate_cover
+              state: closed
+              for:
+                seconds: !input closed_settle
+            - condition: state
+              entity_id: !input lock_boolean
+              state: "off"
+            # The settle delay above can pass while they drive through, so
+            # re-check arrival right before pulsing.
+            - condition: numeric_state
+              entity_id: !input distance_sensor
+              above: !input arrived_distance
+            # FRESH-LOCATION RULE (2026-09-30): only pulse on a location report
+            # made AFTER the gate last changed. When several people ride in one
+            # car, a phone that reports slowly can still show them outside the
+            # gate after the car is through. Without this, once the gate closed
+            # behind them that phone's loop would open it again. Someone really
+            # waiting at a shut gate keeps reporting (every ~10-15 s with approach
+            # high accuracy), so their next report re-pulses; a phone that has
+            # gone quiet because they are already parked does not.
+            - alias: Location reported since the gate last moved
+              condition: template
+              value_template: >-
+                {{ states[person_id] is not none and states[cover_id] is not none
+                   and states[person_id].last_reported > states[cover_id].last_changed }}
+          then:
+            - action: input_boolean.turn_on
+              target:
+                entity_id: !input lock_boolean
+            - action: cover.open_cover
+              target:
+                entity_id: !input gate_cover
+            - delay:
+                seconds: !input lock_hold
+            - action: input_boolean.turn_off
+              target:
+                entity_id: !input lock_boolean
+        - wait_template: "{{ states(distance_entity) | float(99999) <= arrived_at }}"
+          timeout:
+            seconds: !input retry_wait
+      until:
+        - condition: or
+          conditions:
+            - condition: numeric_state
+              entity_id: !input distance_sensor
+              below: !input arrived_distance
+            - condition: template
+              value_template: "{{ repeat.index >= max_passes }}"

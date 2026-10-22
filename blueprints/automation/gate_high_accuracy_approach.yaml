@@ -1,0 +1,284 @@
+blueprint:
+  name: Gate - High Accuracy on Approach
+  description: >
+    Turns a phone's high accuracy location mode ON when the person comes within
+    a set distance of home, and OFF again once they have settled at home - so
+    the gate automations get dense GPS samples for the few minutes they need
+    them instead of all day.
+
+
+    WHY THIS EXISTS: high accuracy mode is the companion app's main battery
+    drain. On this install it defaulted to a 5 SECOND update interval. With it
+    off the app reports every 60-120 s, and on 2026-09-22 that meant an approach
+    jumped 939 m -> 131 m across a single gap, so the gate would have been pulsed
+    with the car already sitting at it. The gate blueprint was retuned the same
+    day (open at 1300 m) to survive sparse sampling on its own, but on
+    2026-09-30 it went back to 500 m because 1300 m opened too early and the
+    gate was closing again on arrival. At 500 m the open depends on a sample
+    landing inside the open distance, and this is what keeps samples ~15 s
+    apart on the final approach. Without it the zone backstop still opens the
+    gate, just late.
+
+
+    WHY NOT THE APP'S OWN TRIGGER ZONE: the companion app can do roughly this
+    itself, but the setting is buried in Manage sensors > Location and is hard
+    to find. Driving it from HA keeps the thresholds visible and tunable in one
+    place, and lets every person share one definition.
+
+
+    COMMANDS ARE SENT priority: high, ttl: 0. Without that, Android treats them
+    as normal-priority push and may hold them while the phone dozes. On
+    2026-09-25 one phone got turn_on at 2.9 miles and again at 1.2 miles, and
+    never engaged before it reached the gate: reports stayed 3-4.5 min apart
+    (on 09-24 engaging had taken 5-10 min). High priority with ttl 0 is the
+    companion app's documented way to deliver commands immediately.
+
+
+    NO DEPENDENCY ON THE HIGH ACCURACY SENSOR. An obvious way to cap the ON time
+    is to watch binary_sensor.<phone>_high_accuracy_mode. That entity only
+    exists on some of these phones - as of 2026-09-22 only two of five had it,
+    and one automation here had been pointing at a high-accuracy sensor that was
+    never registered at all, so its trigger had silently never fired. Instead
+    the armed window is held open by a wait_for_trigger inside the run, which
+    behaves identically on every phone whether or not the sensor exists.
+
+
+    RESTART SAFETY: because the armed window lives inside a run, an HA restart
+    mid-approach kills it and would otherwise strand high accuracy ON forever.
+    The homeassistant start trigger below unconditionally sends turn_off for
+    that reason. The trade-off is that a restart during an actual approach
+    disarms it, and it only re-arms if the person then crosses the re-arm
+    distance. Leaving it ON indefinitely is the worse failure, so it is written
+    this way deliberately.
+  domain: automation
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    who:
+      name: Who is arriving
+      icon: mdi:account
+      input:
+        person_entity:
+          name: Person
+          description: >
+            Used to detect arrival, and to skip arming when they are already
+            home. The distance sensor always reads a small value at home, so
+            without this check a restart could arm high accuracy while parked
+            in the driveway.
+          selector:
+            entity:
+              domain: person
+        distance_sensor:
+          name: Distance-to-gate sensor
+          description: >
+            Numeric sensor giving this person's distance to the gate, in the
+            same unit as the thresholds below (metres by default). The same
+            sensor the gate approach blueprint uses.
+          selector:
+            entity:
+              domain: sensor
+        notify_service:
+          name: Notify service
+          description: >
+            The companion app notify service for this phone, WITHOUT the
+            "notify." prefix - for example mobile_app_pixel_8.
+
+
+            This is free text rather than a selector on purpose: the high
+            accuracy commands need the legacy notify.mobile_app_* service so
+            they can pass a data.data block, and notify.send_message cannot
+            carry one. There is no entity selector for a legacy notify service.
+            Get the exact name from Developer Tools > Actions.
+
+
+            ANDROID ONLY. The high accuracy commands are a no-op on iOS.
+          selector:
+            text:
+    tuning:
+      name: Distances and timing
+      icon: mdi:tune
+      collapsed: true
+      input:
+        arm_distance:
+          name: Arm distance
+          description: >
+            Turn high accuracy on when the person gets this close. Wants to be
+            far enough out that even a 2-minute sampling gap lands a sample
+            inside the ring before the gate automation needs one.
+          default: 8047
+          selector:
+            number:
+              min: 500
+              max: 50000
+              step: 1
+              unit_of_measurement: m
+              mode: box
+        rearm_distance:
+          name: Re-arm distance
+          description: >
+            A second, closer chance to arm. The maximum-on cap can disarm while
+            someone is parked a few miles from home; without this, driving home
+            from there would never re-enable high accuracy because they never
+            re-cross the arm distance.
+
+
+            Known gap: sitting for longer than the cap at somewhere CLOSER than
+            this will not re-arm. The gate's own tuning covers that case on
+            sparse samples, so it is documented rather than engineered around.
+          default: 4000
+          selector:
+            number:
+              min: 200
+              max: 20000
+              step: 1
+              unit_of_measurement: m
+              mode: box
+        disarm_distance:
+          name: Disarm distance
+          description: >
+            Turn high accuracy off again once the person gets this far out -
+            they are driving away, not arriving.
+
+
+            KEEP A GAP ABOVE THE ARM DISTANCE. If this sat at the same value the
+            arm and disarm would fight each other across the boundary. The
+            default leaves roughly a mile of hysteresis.
+          default: 9700
+          selector:
+            number:
+              min: 500
+              max: 60000
+              step: 1
+              unit_of_measurement: m
+              mode: box
+        home_settle:
+          name: Settled-at-home time
+          description: >
+            How long the person must be home before high accuracy is turned off.
+            Covers GPS jitter at the house briefly reading "away". Cut from 15 to
+            5 minutes on 2026-10-12: the gate no longer needs the
+            location once they're through, and the shorter time clears the
+            phone's high-accuracy notice sooner.
+          default:
+            minutes: 5
+          selector:
+            duration:
+        max_on:
+          name: Maximum time on
+          description: >
+            Hard cap on a single armed window. Without it, an afternoon parked
+            inside the arm ring runs high-frequency GPS the whole time, which is
+            the drain this is meant to prevent.
+
+
+            Note this is the timeout of a wait inside the run, so it is not
+            affected by the usual for:-clock resets - but an HA restart ends the
+            run entirely (see RESTART SAFETY above).
+          default:
+            minutes: 45
+          selector:
+            duration:
+        update_interval:
+          name: High accuracy update interval
+          description: >
+            Seconds between location updates while high accuracy is on, set on
+            the way in so the phone never runs even briefly at the app's 5 s
+            default. 15 s is ample for a 500 m gate open distance (about 200 m
+            of travel between samples at 30 mph) and noticeably cheaper than
+            5 s.
+          default: 15
+          selector:
+            number:
+              min: 5
+              max: 60
+              step: 1
+              unit_of_measurement: s
+              mode: box
+
+mode: restart
+
+# !input is a YAML tag, not a template value, so the service name has to be
+# bound here before it can be used in the templated action: below.
+variables:
+  notify_action: !input notify_service
+
+triggers:
+  - trigger: numeric_state
+    entity_id: !input distance_sensor
+    below: !input arm_distance
+    id: arm
+  - trigger: numeric_state
+    entity_id: !input distance_sensor
+    below: !input rearm_distance
+    id: arm_close
+  - trigger: homeassistant
+    event: start
+    id: ha_start
+
+actions:
+  - choose:
+      - alias: Startup safety - never leave high accuracy stranded on
+        conditions:
+          - condition: trigger
+            id: ha_start
+        sequence:
+          - action: "notify.{{ notify_action }}"
+            data:
+              message: command_high_accuracy_mode
+              data:
+                command: turn_off
+                priority: high
+                ttl: 0
+
+      - alias: Arm for the approach, then hold until settled, gone, or capped
+        conditions:
+          - condition: trigger
+            id:
+              - arm
+              - arm_close
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: !input person_entity
+                state: home
+        sequence:
+          - alias: Set the interval BEFORE enabling, never run at the 5 s default
+            action: "notify.{{ notify_action }}"
+            data:
+              message: command_high_accuracy_mode
+              data:
+                command: high_accuracy_set_update_interval
+                high_accuracy_update_interval: !input update_interval
+                priority: high
+                ttl: 0
+
+          - action: "notify.{{ notify_action }}"
+            data:
+              message: command_high_accuracy_mode
+              data:
+                command: turn_on
+                priority: high
+                ttl: 0
+
+          - alias: Hold the armed window open until one of the three exits
+            # wait_for_trigger, not wait_template: the person is known to be away
+            # at this point (see the condition above), so both exits are genuine
+            # future transitions and there is no already-true case to miss.
+            wait_for_trigger:
+              - trigger: state
+                entity_id: !input person_entity
+                to: home
+                for: !input home_settle
+              - trigger: numeric_state
+                entity_id: !input distance_sensor
+                above: !input disarm_distance
+            timeout: !input max_on
+            continue_on_timeout: true
+
+          - action: "notify.{{ notify_action }}"
+            data:
+              message: command_high_accuracy_mode
+              data:
+                command: turn_off
+                priority: high
+                ttl: 0

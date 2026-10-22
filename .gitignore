@@ -1,0 +1,5 @@
+# Private words the privacy check looks for (names, devices, places) - never committed
+_dev/private_terms.txt
+secrets.yaml
+*.bak*
+__pycache__/

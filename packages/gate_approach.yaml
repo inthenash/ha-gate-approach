@@ -1,0 +1,491 @@
+# =====================================================================
+# GATE ON APPROACH - example package
+# =====================================================================
+# Everything the two blueprints need, for ONE gate and TWO people
+# (alex and sam). Copy a person's blocks to add another; keep every
+# person's tuning values identical (see README, "One value for everyone").
+#
+# Install:
+#   1. configuration.yaml:
+#        homeassistant:
+#          packages: !include_dir_named packages
+#   2. Copy this file to /config/packages/gate_approach.yaml
+#   3. Copy blueprints/automation/*.yaml to /config/blueprints/automation/
+#   4. secrets.yaml: gate_zone_latitude / gate_zone_longitude (the house)
+#   5. Find and replace the names below, then restart HA.
+#
+# Replace:
+#   switch.front_gate_trigger     the relay that pulses the gate (momentary)
+#   binary_sensor.front_gate_door the gate's contact sensor (on = not closed)
+#   person.alex / person.sam      people
+#   device_tracker.alex_phone ... their companion-app GPS trackers
+#   mobile_app_alex_phone ...     their companion-app notify services
+#
+# Built from a working install; this file itself is an example and has
+# not been loaded as-is. Check it in Developer Tools > YAML first.
+# =====================================================================
+
+zone:
+  # Centre it on the HOUSE. The distance sensors measure to this centre,
+  # so measure where the gate sits from here (README, "Calibrate").
+  - name: Gate
+    latitude: !secret gate_zone_latitude
+    longitude: !secret gate_zone_longitude
+    radius: 400
+    icon: mdi:gate
+
+input_boolean:
+  # Shared pulse lock. Every automation that can pulse the gate holds it
+  # briefly around the pulse, so two arrivals cannot double-pulse.
+  gate_action_in_progress:
+    name: Gate Action In Progress
+    icon: mdi:lock
+  # Silences the stuck-open alert (parties, deliveries). Clears at 4am.
+  gate_open_alert_muted:
+    name: Gate Open Alert Muted
+    icon: mdi:bell-off
+
+timer:
+  # Started when the person LEAVES the gate zone. While it runs, nothing
+  # opens the gate for them - stops GPS jitter on the way out from
+  # reopening the gate behind them.
+  alex_away:
+    name: Alex Away
+    duration: "00:03:00"
+  sam_away:
+    name: Sam Away
+    duration: "00:03:00"
+
+template:
+  - sensor:
+      # Distance to the zone centre in METRES. Do NOT add
+      # device_class: distance - on an imperial system HA converts the
+      # state to feet and every threshold is silently wrong.
+      # distance() answers in the unit system's length unit:
+      #   imperial (US): miles -> * 1609.344     metric: km -> * 1000
+      - name: Alex Gate Distance
+        unique_id: alex_gate_distance
+        unit_of_measurement: m
+        state_class: measurement
+        availability: >-
+          {{ None not in [state_attr('device_tracker.alex_phone', 'latitude'),
+                          state_attr('device_tracker.alex_phone', 'longitude'),
+                          state_attr('zone.gate', 'latitude'),
+                          state_attr('zone.gate', 'longitude')] }}
+        state: >-
+          {% set la = state_attr('device_tracker.alex_phone', 'latitude') %}
+          {% set lo = state_attr('device_tracker.alex_phone', 'longitude') %}
+          {% set zla = state_attr('zone.gate', 'latitude') %}
+          {% set zlo = state_attr('zone.gate', 'longitude') %}
+          {% if None not in [la, lo, zla, zlo] %}
+            {{ (distance(la | float, lo | float, zla | float, zlo | float) * 1609.344) | round(0) }}
+          {% endif %}
+      - name: Sam Gate Distance
+        unique_id: sam_gate_distance
+        unit_of_measurement: m
+        state_class: measurement
+        availability: >-
+          {{ None not in [state_attr('device_tracker.sam_phone', 'latitude'),
+                          state_attr('device_tracker.sam_phone', 'longitude'),
+                          state_attr('zone.gate', 'latitude'),
+                          state_attr('zone.gate', 'longitude')] }}
+        state: >-
+          {% set la = state_attr('device_tracker.sam_phone', 'latitude') %}
+          {% set lo = state_attr('device_tracker.sam_phone', 'longitude') %}
+          {% set zla = state_attr('zone.gate', 'latitude') %}
+          {% set zlo = state_attr('zone.gate', 'longitude') %}
+          {% if None not in [la, lo, zla, zlo] %}
+            {{ (distance(la | float, lo | float, zla | float, zlo | float) * 1609.344) | round(0) }}
+          {% endif %}
+
+  - cover:
+      # One momentary relay does open, close and stop. The cover only
+      # reports what the contact sensor says.
+      - name: Front Gate
+        unique_id: front_gate_cover
+        device_class: gate
+        # An unavailable sensor must NOT read as a closed gate. Every pulse
+        # is guarded on "closed", and a pulse mid-travel stops these gates
+        # dead, so a cover that claims "closed" while its sensor is offline
+        # is the dangerous direction. has_value() is false for both
+        # unavailable and unknown, so the cover goes unavailable instead.
+        availability: "{{ has_value('binary_sensor.front_gate_door') }}"
+        state: "{{ 'open' if is_state('binary_sensor.front_gate_door', 'on') else 'closed' }}"
+        open_cover: &pulse
+          - action: switch.turn_on
+            target:
+              entity_id: switch.front_gate_trigger
+          - delay: "00:00:01"
+          - action: switch.turn_off
+            target:
+              entity_id: switch.front_gate_trigger
+        close_cover: *pulse
+        stop_cover: *pulse
+
+automation:
+  # -------------------------------------------------------------------
+  # 1. OPEN ON APPROACH - one per person, all with the same values
+  # -------------------------------------------------------------------
+  - id: gate_open_on_approach_alex
+    alias: Gate - Open on Alex's Approach
+    use_blueprint:
+      path: gate_approach_open.yaml
+      input:
+        person_entity: person.alex
+        distance_sensor: sensor.alex_gate_distance
+        away_timer: timer.alex_away
+        gate_cover: cover.front_gate
+        lock_boolean: input_boolean.gate_action_in_progress
+        trigger_distance: 2500
+        open_distance: 500
+        max_attempts: 8
+        approach_timeout: 900
+  - id: gate_open_on_approach_sam
+    alias: Gate - Open on Sam's Approach
+    use_blueprint:
+      path: gate_approach_open.yaml
+      input:
+        person_entity: person.sam
+        distance_sensor: sensor.sam_gate_distance
+        away_timer: timer.sam_away
+        gate_cover: cover.front_gate
+        lock_boolean: input_boolean.gate_action_in_progress
+        trigger_distance: 2500
+        open_distance: 500
+        max_attempts: 8
+        approach_timeout: 900
+
+  # -------------------------------------------------------------------
+  # 2. HIGH ACCURACY ON APPROACH - dense GPS only for the last few miles
+  #    (Android companion app only; a no-op on iOS)
+  # -------------------------------------------------------------------
+  - id: gate_high_accuracy_alex
+    alias: Gate - High Accuracy on Approach (Alex)
+    use_blueprint:
+      path: gate_high_accuracy_approach.yaml
+      input:
+        person_entity: person.alex
+        distance_sensor: sensor.alex_gate_distance
+        notify_service: mobile_app_alex_phone
+  - id: gate_high_accuracy_sam
+    alias: Gate - High Accuracy on Approach (Sam)
+    use_blueprint:
+      path: gate_high_accuracy_approach.yaml
+      input:
+        person_entity: person.sam
+        distance_sensor: sensor.sam_gate_distance
+        notify_service: mobile_app_sam_phone
+
+  # -------------------------------------------------------------------
+  # 3. AWAY TIMERS - leaving the gate zone blocks a reopen for 3 minutes
+  # -------------------------------------------------------------------
+  - id: gate_away_timer_start
+    alias: Gate - Start Away Timer on Leaving
+    triggers:
+      - trigger: zone
+        entity_id: person.alex
+        zone: zone.gate
+        event: leave
+        id: alex
+      - trigger: zone
+        entity_id: person.sam
+        zone: zone.gate
+        event: leave
+        id: sam
+    actions:
+      - action: timer.start
+        target:
+          entity_id: "timer.{{ trigger.id }}_away"
+    mode: parallel
+
+  # -------------------------------------------------------------------
+  # 4. ZONE BACKSTOP - opens on entering the 400 m zone if the approach
+  #    automation did not. Pulses only a gate that has been closed 15 s.
+  #    No retry: if the gate is mid-cycle when they enter, it skips.
+  # -------------------------------------------------------------------
+  - id: gate_zone_backstop
+    alias: Gate - Open on Zone Enter (backstop)
+    description: >-
+      The lock (input_boolean.gate_action_in_progress) is only released by
+      the run that took it - see variables.acquired_lock. A run that skipped
+      the open must not release a lock another arrival is still holding.
+    triggers:
+      - trigger: zone
+        entity_id: person.alex
+        zone: zone.gate
+        event: enter
+        id: alex
+      - trigger: zone
+        entity_id: person.sam
+        zone: zone.gate
+        event: enter
+        id: sam
+    conditions:
+      - condition: template
+        value_template: "{{ states('timer.' ~ trigger.id ~ '_away') == 'idle' }}"
+    variables:
+      acquired_lock: >-
+        {{ is_state('input_boolean.gate_action_in_progress', 'off')
+           and is_state('cover.front_gate', 'closed') }}
+    actions:
+      - alias: Let a just-closed gate settle before pulsing
+        # The contact reads closed 3-7 s before the motor stops; a pulse in
+        # that gap stops the gate instead of opening it.
+        if:
+          - condition: state
+            entity_id: cover.front_gate
+            state: closed
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: cover.front_gate
+                state: closed
+                for:
+                  seconds: 15
+        then:
+          - delay:
+              seconds: 15
+      - if:
+          - condition: state
+            entity_id: input_boolean.gate_action_in_progress
+            state: "off"
+          - condition: state
+            entity_id: cover.front_gate
+            state: closed
+            for:
+              seconds: 15
+        then:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.gate_action_in_progress
+          - action: cover.open_cover
+            target:
+              entity_id: cover.front_gate
+      - if:
+          - condition: template
+            value_template: "{{ acquired_lock }}"
+        then:
+          - delay:
+              seconds: 15
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.gate_action_in_progress
+    mode: parallel
+    max: 6
+
+  # -------------------------------------------------------------------
+  # 5. STUCK-OPEN WARNING (+ one-tap mute, re-armed at 4am)
+  #    Every pulse is guarded on "fully closed", so nothing will ever
+  #    re-pulse a gate stopped part-way. This is what notices.
+  # -------------------------------------------------------------------
+  - id: gate_stuck_open_warning
+    alias: Gate - Stuck Open Warning
+    triggers:
+      - trigger: state
+        entity_id: cover.front_gate
+        to: open
+        for: "00:05:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.gate_open_alert_muted
+        state: "off"
+    actions:
+      - repeat:
+          sequence:
+            - variables:
+                open_mins: >-
+                  {{ ((now() - states.cover.front_gate.last_changed).total_seconds() / 60) | round(0) }}
+            - action: persistent_notification.create
+              data:
+                title: Front gate still open
+                notification_id: front_gate_stuck_open
+                message: >-
+                  The front gate has been open for {{ open_mins }} minutes. A full
+                  open-dwell-close cycle is only about 130 seconds, so it has most
+                  likely been stopped part-way or something is holding it. No
+                  automation will re-pulse it. Holding it open on purpose? Turn on
+                  Gate Open Alert Muted - it clears itself at 4am.
+            - action: notify.mobile_app_alex_phone
+              data:
+                title: Front gate still open
+                message: >-
+                  Open {{ open_mins }} min - far longer than a normal ~130 s cycle.
+                  Likely stopped mid-travel or obstructed.
+                data:
+                  tag: front_gate_stuck_open
+                  importance: high
+                  actions:
+                    - action: MUTE_GATE_ALERT
+                      title: Mute gate alerts
+            - wait_for_trigger:
+                - trigger: state
+                  entity_id: cover.front_gate
+                  to: closed
+                - trigger: state
+                  entity_id: input_boolean.gate_open_alert_muted
+                  to: "on"
+              timeout: "00:15:00"
+          until:
+            - condition: or
+              conditions:
+                - condition: state
+                  entity_id: cover.front_gate
+                  state: closed
+                - condition: state
+                  entity_id: input_boolean.gate_open_alert_muted
+                  state: "on"
+                - condition: template
+                  value_template: "{{ repeat.index >= 4 }}"
+      - if:
+          - condition: or
+            conditions:
+              - condition: state
+                entity_id: cover.front_gate
+                state: closed
+              - condition: state
+                entity_id: input_boolean.gate_open_alert_muted
+                state: "on"
+        then:
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: front_gate_stuck_open
+    mode: single
+
+  - id: gate_alert_mute_button
+    alias: Gate - Alert Mute Button
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: MUTE_GATE_ALERT
+    actions:
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.gate_open_alert_muted
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: front_gate_stuck_open
+    mode: single
+
+  - id: gate_alert_rearm_4am
+    alias: Gate - Re-arm Alert Mute at 4am
+    triggers:
+      - trigger: time
+        at: "04:00:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.gate_open_alert_muted
+        state: "on"
+    actions:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.gate_open_alert_muted
+      - action: persistent_notification.create
+        data:
+          title: Gate alerts re-armed
+          notification_id: gate_alert_rearmed
+          message: >-
+            Stuck-open gate alerts were muted overnight and are back on.
+    mode: single
+
+  # -------------------------------------------------------------------
+  # 6. GATE SENSOR WATCHDOG - a dead contact sensor silently stops every
+  #    gate automation (they all wait for "closed")
+  # -------------------------------------------------------------------
+  - id: gate_sensor_watchdog
+    alias: Gate - Sensor Watchdog
+    description: >-
+      1. No response to a pulse: an automation took the lock (it is about to
+      fire the relay) but the sensor did not read open within 45 s (normal is
+      6-8 s). 2. Sensor unavailable for 15 min. Silence alone is NOT a fault:
+      a healthy sensor reports nothing while nobody uses the gate. Manual
+      pulses (remote, keypad, app) do not take the lock, so are not checked.
+    triggers:
+      - trigger: state
+        entity_id: input_boolean.gate_action_in_progress
+        from: "off"
+        to: "on"
+        id: pulse
+      - trigger: state
+        entity_id: binary_sensor.front_gate_door
+        to: unavailable
+        for: "00:15:00"
+        id: unavailable
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: pulse
+            sequence:
+              - condition: state
+                entity_id: binary_sensor.front_gate_door
+                state: "off"
+              - wait_for_trigger:
+                  - trigger: state
+                    entity_id: binary_sensor.front_gate_door
+                    to: "on"
+                timeout: "00:00:45"
+                continue_on_timeout: true
+              - condition: template
+                value_template: "{{ wait.trigger is none }}"
+              - variables:
+                  reason: >-
+                    The gate was pulsed at {{ now().strftime('%H:%M') }} but its
+                    sensor did not report it opening within 45 s. Either the gate
+                    did not move or the sensor has failed.
+          - conditions:
+              - condition: trigger
+                id: unavailable
+            sequence:
+              - variables:
+                  reason: >-
+                    The gate sensor has been unavailable for 15 minutes. Gate
+                    automations will not pulse the gate until it is back.
+      - action: persistent_notification.create
+        data:
+          title: Gate sensor watchdog
+          notification_id: gate_sensor_watchdog
+          message: "{{ reason }}"
+    mode: single
+
+  # -------------------------------------------------------------------
+  # 7. PHONE LOCATION WATCHDOG - one per person. A phone that stops
+  #    reporting cannot open the gate. last_reported, not last_changed:
+  #    a parked phone updates attributes without changing state.
+  # -------------------------------------------------------------------
+  - id: phone_location_watchdog_alex
+    alias: Phone Location Watchdog - Alex
+    triggers:
+      - trigger: template
+        value_template: >-
+          {{ states.device_tracker.alex_phone is not none and
+             (now() - states.device_tracker.alex_phone.last_reported).total_seconds() > 2700 }}
+    actions:
+      - action: persistent_notification.create
+        data:
+          title: Phone location watchdog - Alex
+          notification_id: phone_location_watchdog_alex
+          message: >-
+            Alex's phone has not reported its location for
+            {{ ((now() - states.device_tracker.alex_phone.last_reported).total_seconds() / 60) | round(0) }}
+            minutes. The gate will not open on arrival until it resumes. Check the
+            Home Assistant app's battery setting is Unrestricted.
+    mode: single
+  - id: phone_location_watchdog_sam
+    alias: Phone Location Watchdog - Sam
+    triggers:
+      - trigger: template
+        value_template: >-
+          {{ states.device_tracker.sam_phone is not none and
+             (now() - states.device_tracker.sam_phone.last_reported).total_seconds() > 2700 }}
+    actions:
+      - action: persistent_notification.create
+        data:
+          title: Phone location watchdog - Sam
+          notification_id: phone_location_watchdog_sam
+          message: >-
+            Sam's phone has not reported its location for
+            {{ ((now() - states.device_tracker.sam_phone.last_reported).total_seconds() / 60) | round(0) }}
+            minutes. The gate will not open on arrival until it resumes. Check the
+            Home Assistant app's battery setting is Unrestricted.
+    mode: single
